@@ -56,13 +56,7 @@ vmail ls mbox
 To limit results to a single domain:
 
 ```sh
-vmail ls mbox @mail.doma.in
-```
-
-To limit to a single mailbox name, across all domains:
-
-```sh
-vmail ls mbox james@
+vmail ls mbox mail.doma.in
 ```
 
 Each mailbox represents a singular destination for email.

@@ -1,0 +1,1596 @@
+#!/usr/bin/perl
+package vmail;
+use strict;
+use warnings;
+use DBI qw//;
+
+sub randstr
+{
+	my ($len) = @_;
+	my @ll = ("A".."Z", "a".."z", "0".."9");
+	my $s; $s .= $ll[rand @ll] for 1..$len;
+	return $s;
+}
+
+sub new
+{
+	my ($class, $dsn, $log) = @_;
+	my $self = {
+		db => DBI->connect($dsn, '', '',
+			{ AutoCommit => 1,
+			  RaiseError => 1 }),
+		log => $log || 0,
+	};
+	bless($self, $class);
+}
+
+sub info
+{
+	my ($self, $fmt, @rest) = @_;
+	return unless $self->{log} > 0;
+	printf STDERR "$fmt\n", @rest;
+}
+
+sub debug
+{
+	my ($self, $fmt, @rest) = @_;
+	return unless $self->{log} > 1;
+	printf STDERR "DEBUG> $fmt\n", @rest;
+}
+
+sub trace
+{
+	my ($self, $fmt, @rest) = @_;
+	return unless $self->{log} > 2;
+	printf STDERR "TRACE> $fmt\n", @rest;
+}
+
+sub sql
+{
+	my ($self, $sql, @params) = @_;
+	my $q = $self->{db}->prepare($sql);
+	$self->trace("executing sql `%s` with params [%s]", $sql, join(', ', @params));
+	$q->execute(@params);
+	return $q;
+}
+
+sub _where
+{
+	my (%where) = @_;
+	my @fields = ();
+	my @values = ();
+	for (keys %where) {
+		push @fields, "$_ = ?";
+		push @values, $where{$_};
+	}
+	return "1" unless @values;
+	return (join(' AND ', @fields), @values);
+}
+
+sub query
+{
+	my ($self, $sql, @params) = @_;
+	my @results = ();
+	my $q = $self->sql($sql, @params);
+	while (my $r = $q->fetchrow_hashref) {
+		push @results, $r;
+	}
+	$self->trace("found %d results", scalar @results);
+	@results;
+}
+
+sub select
+{
+	my $extra = '';
+	if (@_ % 2 == 1) {
+		$extra = pop @_;
+	}
+	my ($self, $from, %where) = @_;
+
+	my ($clause, @params) = _where(%where);
+	return $self->query("SELECT * FROM $from WHERE $clause $extra", @params);
+}
+
+sub insert
+{
+	my ($self, $into, %attrs) = @_;
+	my @fields = ();
+	my @values = ();
+
+	for (keys %attrs) {
+		push @fields, $_;
+		push @values, $attrs{$_};
+	}
+
+	my $sql = "INSERT INTO $into (".
+		join(',', @fields).") VALUES (".
+		join(',', map { '?' } @fields).")";
+
+	$self->sql($sql, @values);
+}
+
+sub delete
+{
+	my ($self, $from, %where) = @_;
+	my ($clause, @values) = _where(%where);
+	$self->sql("DELETE FROM $from WHERE $clause", @values);
+}
+
+sub find_domains
+{
+	my ($self) = @_;
+	$self->info('retrieving domains (by looking at `transport` table)');
+	$self->select('transport', 'ORDER BY domain ASC');
+}
+
+sub new_domain
+{
+	my ($self, $transport, $domain) = @_;
+	$self->info('creating new domain "%s:%s"', $transport, $domain);
+	$self->insert('transport',
+		transport => "$transport:",
+		domain    => $domain);
+}
+
+sub need_domain
+{
+	my ($self, $transport, $domain) = @_;
+	$self->info('checking if we have a domain matching "%s:%s"', $transport, $domain);
+	$self->select('transport',
+		transport => "$transport:",
+		domain    => $domain)
+		or $self->new_domain($transport, $domain);
+}
+
+sub rm_domain
+{
+	my ($self, $transport, $domain) = @_;
+	$self->info('removing domain "%s:%s"', $transport, $domain);
+	$self->delete('transport',
+		transport => "$transport:",
+		domain    => $domain);
+}
+
+sub find_lists
+{
+	my ($self) = @_;
+	$self->info('retrieving mailing lists (by looking at `lists` table)');
+	$self->select('lists', 'ORDER BY address ASC');
+}
+
+sub find_mailboxes
+{
+	my ($self, $domain) = @_;
+	my %where = ();
+	$where{domain} = $domain if $domain;
+	$self->info('retrieving mailboxes (by looking at `users` view)');
+	$self->select('users', %where, 'ORDER BY address ASC');
+}
+
+sub new_mailbox
+{
+	my ($self, $user, $domain, $name, $password) = @_;
+	$self->info('creating new mailbox (in `accounts` table) "%s" <%s@%s> with %spassword',
+		$name, $user, $domain, $password ? "" : "randomized ");
+	$self->insert('accounts',
+		username  => $user,
+		domain    => $domain,
+		name      => $name,
+		password  => $password || randstr(64),
+	);
+}
+
+sub rm_mailbox
+{
+	my ($self, $user, $domain) = @_;
+	$self->info('removing mailbox (from `accounts` table) <%s@%s>', $user, $domain);
+	$self->delete('accounts',
+		username  => $user,
+		domain    => $domain,
+	);
+}
+
+sub find_aliases
+{
+	my ($self, $where) = @_;
+	     if ($where && $where =~ m/\@$/) { $where = qr/^\Q$where\E/;
+	} elsif ($where && $where =~ m/^\@/) { $where = qr/\Q$where\E$/;
+	} elsif ($where)                     { $where = qr/\Q$where\E.*@/; }
+
+	$self->info('retreiving aliases');
+	my @ll = $self->select('aliases', 'ORDER BY alias ASC');
+	return $where ? grep { $_->{alias} =~ $where || $_->{address} =~ $where } @ll
+	              : @ll;
+}
+
+sub new_alias
+{
+	my ($self, $alias, $address) = @_;
+	$self->info('creating new alias %s -> %s', $alias, $address);
+	$self->insert('aliases',
+		alias   => $alias,
+		address => $address,
+	);
+}
+
+sub rm_alias
+{
+	my ($self, $alias) = @_;
+	$self->info('removing alias %s', $alias);
+	$self->delete('aliases', alias => $alias);
+}
+
+sub passwd
+{
+	my ($self) = @_;
+
+	my $prog = '/usr/bin/doveadm';
+	-x $prog or die "Can't find $prog; is Dovecot installed?\n";
+
+	$self->info('prompting for password');
+	$self->debug('running `%s pw -s SSHA256`', $prog);
+	my $pw = qx($prog pw -s SSHA256);
+	$pw =~ s/\n$//;
+	return $pw;
+}
+
+sub set_passwd
+{
+	my ($self, $email, $password) = @_;
+	my ($user, $domain) = split /\@/, $email;
+	$self->info('setting password for %s@%s', $user, $domain);
+	$self->sql("UPDATE accounts SET password = ? ".
+		"WHERE username = ? AND domain = ?",
+		$password, $user, $domain);
+}
+
+1;
+
+=head1 NAME
+
+vmail - Email Platform Management
+
+=head1 DESCRIPTION
+
+vmail provides a database schema, suggested configurations for
+Dovecot / Postfix, and a tool (vmail) that can collectively manage
+a multi-domain email server easily.
+
+=head1 METHODS
+
+=head2 new($dsn)
+
+Create a new vmail handle, attaching it to the database
+identified by B<$dsn>.  If the connection fails, DBI will die,
+so you may want to call this from inside of an eval { ... } block.
+
+=head2 sql($sql, @params)
+
+Prepare a SQL statement, bind parameters to it, and execute it
+against the database handle.  Returns the prepared statements,
+which can be used for retrieving results.
+
+=head2 select($from, %where, [$extra_sql])
+
+Select records from the database, returning an array of hashrefs.
+The B<%where> hash will be turned into a WHERE clause.  If no
+conditions are given, all rows will be returned.
+
+If B<$extra_sql> is given, it will be tacked onto the end of the
+SQL query, after the WHERE clause.
+
+=head2 insert($into, %attrs)
+
+Insert a new record into a table in the database.  The B<%attrs>
+hash is taken as a field => value map of the columns that should
+be populated.
+
+=head2 delete($from, %where)
+
+Delete records from a table that match the AND'ed WHERE clause
+specified by B<%where>.  If B<%where> is empty, all records will
+be deleted.
+
+=head2 find_domains
+
+Retrieve a list of all domains defined.
+
+=head2 new_domain($transport, $domain)
+
+Define a new domain, with the given Postfix transport (usually,
+C<virtual>).
+
+=head2 rm_domain($transport, $domain)
+
+Remove the domain definition that matches the transport and domain
+name.
+
+=head2 find_mailboxes([$domain])
+
+Retrieve a list of all mailboxes, optionally filtered to those on
+the given B<$domain>.
+
+=head2 new_mailbox($user, $domain, $full_name, $password)
+
+Create a new mailbox in the database.  Note that filesystem storage
+will not be allocated, that' is left to Postfix and/or Dovecot.
+
+=head2 rm_mailbox($user, $domain)
+
+Delete a mailbox.
+
+=head2 find_aliases
+
+Retrieve a list of all defined aliases.  Filtering is not currently
+possible.
+
+=head2 new_alias($alias, $email)
+
+Define a new alias email.  Both B<$alias> and B<$email> must have
+user and domain components.
+
+=head2 rm_alias($alias)
+
+Remove an alias rule from the database.
+
+=head2 passwd
+
+Run the dovecotpw command and return the encrypted password that
+it generated.  The end user will be responsible for typing the
+password into the console.
+
+=head2 set_passwd($email, $password)
+
+Update the password of B<$email>.  B<$password> should be the
+SSHA_256 hashed version of the password, not the cleartext.
+
+=head1 AUTHOR
+
+Written by James Hunt <james@niftylogic.com>
+
+=cut
+package main;
+use warnings;
+use strict;
+use Getopt::Long     qw/:config bundling/;
+use IO::Socket::INET qw//;
+use Sys::Syslog      qw/:standard :macros/;
+use Fcntl            qw/:flock/;
+my $V;
+my %OPTIONS;
+
+#########################################################################
+
+sub usage
+{
+	my ($str, @rest) = @_;
+	print "vmail - Virtual Mail Controller\n";
+	print "USAGE: $str\n";
+	print "       $_\n" for @rest;
+	exit 1;
+}
+sub help
+{
+	print "vmail - Virtual Mail Controller\n";
+	print "Copyright (c) 2013-2017 James Hunt\n";
+	print "\n";
+	print "USAGE: $0 cmd type [options]\n";
+	print "\n";
+	print "  help   - This help screen\n";
+	print "  guide  - Show suggested configuration file contents\n";
+	print "  schema - Print vmail DB schema to standard output\n";
+	print "\n";
+	print "  list domains\n";
+	print "   add domain <domain>\n";
+	print "    rm domain <domain>\n";
+	print "\n";
+	print "  list lists\n";
+	print "   add list [--owner <address>] [--name 'List Name'] <address>\n";
+	print "    rm list <address>\n";
+	print "\n";
+	print "  ls subscribers <list>\n";
+	print "       subscribe <list> <address>\n";
+	print "     unsubscribe <list> <address>\n";
+	print "           block <list> <address>\n";
+	print "         unblock <list> <address>\n";
+	print "\n";
+	print "  list aliases\n";
+	print "   add alias <alias> <address>\n";
+	print "    rm alias <alias>\n";
+	print "\n";
+	print "  list mailboxes [domain]\n";
+	print "   new mailbox <address> <display name>\n";
+	print "    rm mailbox <address>\n";
+	print "\n";
+	print "  passwd <address>\n";
+	print "\n";
+	exit 0;
+}
+
+sub lpad
+{
+	my ($s, $l, $f) = (@_);
+	my $n = $l - length $s;
+	return $n > 0 ? $s . (($f || ' ') x $n)
+	              : $s;
+}
+
+sub rpad
+{
+	my ($s, $l, $f) = (@_);
+	my $n = $l - length $s;
+	return $n > 0 ? (($f || ' ') x $n) . $s
+	              :                      $s;
+}
+
+sub list_domains
+{
+	for my $t ($V->find_domains) {
+		print rpad($t->{transport}, 15), " ", $t->{domain}, "\n";
+	}
+	exit 0;
+}
+
+sub new_domain
+{
+	my ($spec) = @_;
+	my ($transport, $domain) = split /\s*:\s*/, $spec;
+	if (!$transport || !$domain) {
+		usage("$0 add domain virtual:example.com",
+		      "$0 add domain local:example.int");
+	}
+	$V->new_domain($transport, $domain);
+}
+
+sub new_domains
+{
+	if (!@_) {
+		usage("$0 add domain virtual:example.com",
+		      "$0 add domain local:example.int");
+	}
+	new_domain $_ for @_;
+	list_domains unless $OPTIONS{quiet};
+}
+
+sub rm_domain
+{
+	my ($spec) = @_;
+	my ($transport, $domain) = split /\s*:\s*/, $spec;
+	if (!$transport || !$domain) {
+		usage("$0 rm domain virtual:example.com",
+		      "$0 rm domain local:example.int");
+	}
+	$V->rm_domain($transport, $domain);
+}
+
+sub rm_domains
+{
+	if (!@_) {
+		usage("$0 rm domain virtual:example.com",
+		      "$0 rm domain local:example.int");
+	}
+	rm_domain $_ for @_;
+	list_domains unless $OPTIONS{quiet};
+}
+
+sub list_lists
+{
+	for my $m ($V->find_lists(@_)) {
+		print '"', $m->{name}, '" <', $m->{address}, ">\n";
+	}
+}
+
+sub new_list
+{
+	if (!$OPTIONS{owner}) {
+		usage("$0 add list --owner ADDRESS [--name NAME]",
+		      "            [--archives PATH] [--restricted]",
+		      "            list\@doma.in",
+		      "",
+		      " (the --owner flag is required)");
+	}
+	if (@_ != 1) {
+		usage("$0 add list [OPTIONS] list\@doma.in");
+	}
+
+	my $list = $_[0];
+	my ($user, $domain) = split /@/, $list;
+	my $reqs = "$user-requests\@$domain";
+	$OPTIONS{name} ||= "$user Mailing List";
+
+	my $alias = '';
+	if ($domain !~ m/^lists\./) {
+		my $list_alias = "$user\@$domain";
+		my $reqs_alias = "$user-requests\@$domain";
+
+		$list = "$user\@lists.$domain";
+		$reqs = "$user-requests\@lists.$domain";
+
+		$V->need_domain(virtual => $domain);
+
+		$V->new_alias($list_alias => $list);
+		$V->new_alias($reqs_alias => $reqs);
+
+		$domain = "lists.$domain";
+		$list = "$user\@$domain";
+
+		$alias = $list_alias;
+	}
+	$V->need_domain(lists => $domain);
+
+	$V->new_alias("$user-owner\@$domain", $OPTIONS{owner});
+
+	$V->new_mailbox("$user-requests", $domain, "$OPTIONS{name} (requests)");
+	$V->new_mailbox( $user,           $domain, "$OPTIONS{name}");
+
+	$V->info("creating data directory %s/lists/%s", $OPTIONS{dataroot}, $list);
+	mkdir $OPTIONS{dataroot}."/lists";
+	mkdir $OPTIONS{dataroot}."/lists/$list";
+	mkdir $OPTIONS{dataroot}."/lists/$list/archives";
+	mkdir $OPTIONS{dataroot}."/lists/$list/outstanding";
+	mkdir $OPTIONS{dataroot}."/lists/$list/requests";
+	mkdir $OPTIONS{dataroot}."/lists/$list/subscribers";
+
+	my $fh;
+	my $listid = $list; $listid =~ s/@/./;
+
+	open $fh, ">", $OPTIONS{dataroot}."/lists/$list/headers"
+		or die "unable to open $OPTIONS{dataroot}/lists/$list/headers: $!\n";
+	print $fh "-X-Original-To\n";
+	print $fh "-Delivered-To\n";
+	print $fh "-Received\n";
+	print $fh "-Message-ID\n";
+	print $fh "\n";
+	print $fh "+To: $list\n";
+	print $fh "+Reply-To: $list\n";
+	print $fh "\n";
+	print $fh "+Precedence: bulk\n";
+	print $fh "+List-Id: $OPTIONS{name} <$listid>\n";
+	print $fh "+List-Owner: <$user-owner\@$domain>\n";
+	print $fh "+List-Archive: <https://$domain/$user/archives>\n";
+
+	while (<DATA>) {
+		if (m/^---* (.+) ---*$/) {
+			close $fh;
+			open $fh, ">", $OPTIONS{dataroot}."/lists/$list/requests/$1"
+				or die "unable to open $OPTIONS{dataroot}/lists/$list/requests/$1: $!\n";
+			next;
+		}
+		print $fh $_;
+	}
+	close $fh;
+
+	my (undef, undef, $uid, $gid) = getpwnam 'vmail';
+	if (defined $uid) {
+		chown $uid, $gid, $OPTIONS{dataroot}."/lists/$list";
+		chown $uid, $gid, $OPTIONS{dataroot}."/lists/$list/headers";
+		chown $uid, $gid, $OPTIONS{dataroot}."/lists/$list/archives";
+		chown $uid, $gid, $OPTIONS{dataroot}."/lists/$list/outstanding";
+		chown $uid, $gid, $OPTIONS{dataroot}."/lists/$list/requests";
+		chown $uid, $gid, $OPTIONS{dataroot}."/lists/$list/subscribers";
+	}
+
+	for my $h (ml_hashes()) {
+		open $fh, ">", $OPTIONS{dataroot}."/lists/$list/subscribers/$h"
+			or die "unable to open $OPTIONS{dataroot}/lists/$list/subscribers/$h: $!\n";
+		close $fh;
+		chown $uid, $gid, $OPTIONS{dataroot}."/lists/$list/subscribers/$h"
+			if defined $uid;
+	}
+
+	$V->insert('lists',
+		address => $list,
+		name    => $OPTIONS{name},
+		owner   => $OPTIONS{owner},
+		alias   => $alias);
+
+	list_lists($domain) unless $OPTIONS{quiet};
+}
+
+sub rm_lists
+{
+	if (!@_) {
+		usage("$0 rm list LIST [LIST ...]");
+	}
+	for my $list (@_) {
+		my ($user, $domain) = split /\@/, $list;
+		if (!$user || !$domain) {
+			usage("$0 rm list list\@example.com");
+		}
+
+		if ($domain !~ /^lists\./) {
+			$V->rm_alias("$user\@$domain");
+			$V->rm_alias("$user-requests\@$domain");
+
+			$domain = "lists.$domain";
+			$list = "$user\@$domain";
+		}
+
+		$V->rm_alias("$user-owner\@$domain");
+
+		$V->rm_mailbox( $user,           $domain);
+		$V->rm_mailbox("$user-requests", $domain);
+
+		qx(rm -rf $OPTIONS{dataroot}/lists/$list);
+
+		$V->delete('lists', address => $list);
+	}
+}
+
+sub list_subscribers
+{
+}
+
+sub subscribe
+{
+}
+
+sub unsubscribe
+{
+}
+
+sub block
+{
+}
+
+sub unblock
+{
+}
+
+sub list_mailboxes
+{
+	for my $m ($V->find_mailboxes(@_)) {
+		print '"', $m->{name}, '" <', $m->{address}, ">\n";
+	}
+}
+
+sub new_mailbox
+{
+	my ($email, $name, $password) = @_;
+	my ($user, $domain) = split /\@/, $email;
+	if (!$user || !$domain || !$name) {
+		usage("$0 add mailbox user\@example.com 'Full Name'",
+		      "$0 add mailbox user\@example.com 'Full Name' password");
+	}
+	$V->new_mailbox($user, $domain, $name, $password);
+	list_mailboxes($domain) unless $OPTIONS{quiet};
+}
+
+sub rm_mailbox
+{
+	if (!@_) {
+		usage("$0 rm mailbox MAILBOX [MAILBOX ...]");
+	}
+	for my $email (@_) {
+		my ($user, $domain) = split /\@/, $email;
+		if (!$user || !$domain) {
+			usage("$0 rm mailbox user\@example.com");
+		}
+		$V->rm_mailbox($user, $domain);
+		list_mailboxes($domain) unless $OPTIONS{quiet};
+	}
+}
+
+sub list_aliases
+{
+	if (@_ > 1) {
+		usage("$0 ls aliases [\@mail.doma.in]",
+		      "$0 ls aliases [user\@]");
+	}
+
+	for my $a ($V->find_aliases(@_)) {
+		print rpad($a->{alias}, 30), " -> ", $a->{address}, "\n";
+	}
+}
+
+sub new_alias
+{
+	my ($alias, $real) = @_;
+	my ($a_user, $a_domain) = split /\@/, $alias;
+	my ($r_user, $r_domain) = split /\@/, $real;
+	$a_domain = $r_domain unless $a_domain;
+
+	if (!$a_user || !$a_domain || !$r_user || !$r_domain) {
+		usage("$0 add alias me\@example.com",
+		      "$0 add alias\@other.domain.com me\@domain.net");
+	}
+
+	$alias = "$a_user\@$a_domain";
+	$real  = "$r_user\@$r_domain";
+
+	$V->new_alias($alias, $real);
+	list_aliases unless $OPTIONS{quiet};
+}
+
+sub rm_alias
+{
+	if (!@_) {
+		usage("$0 rm alias ALIAS [ALIAS ...]");
+	}
+	for my $alias (@_) {
+		my ($a_user, $a_domain) = split /\@/, $alias;
+
+		if (!$a_user || !$a_domain) {
+			usage("$0 rm alias aka\@example.org");
+		}
+		$V->rm_alias($alias);
+	}
+}
+
+sub rm_aliases
+{
+	if (!@_) {
+		usage("$0 rm alias aka\@example.org");
+	}
+	rm_alias $_ for @_;
+	list_aliases unless $OPTIONS{quiet};
+}
+
+sub passwd
+{
+	my ($email) = @_;
+	my ($user, $domain) = split /\@/, $email;
+
+	if (!$user || !$domain) {
+		usage("$0 passwd user\@domain.name");
+	}
+
+	my $pass = $V->passwd;
+	if (!$pass) {
+		print STDERR "not updating password.\n";
+		exit 1;
+	}
+
+	$V->set_passwd($email, $pass);
+	print STDERR "password changed.\n";
+}
+
+sub guide
+{
+	print <<EOF;
+/etc/dovecot/dovecot.conf
+---------------------------------------------------------------------------
+...
+auth default {
+  mechanisms    = plain login cram-md5
+  user          = nobody
+
+  mail_location = maildir:/srv/mail/%d/%n
+  mail_uid      = 999
+  mail_gid      = 999
+
+  passdb sql {
+    args /etc/dovecot/sql.conf
+  }
+  userdb sql {
+    args /etc/dovecot/sql.conf
+  }
+
+  socket listen {
+    client {
+      path  = /var/spool/postfix/private/auth
+      mode  = 0660
+      user  = postfix
+      group = postfix
+    }
+  }
+}
+...
+---------------------------------------------------------------------------
+
+
+/etc/dovecot/sql.conf
+---------------------------------------------------------------------------
+driver              = sqlite
+connect             = $OPTIONS{database}
+default_pass_scheme = SSHA_256
+password_query      = SELECT address AS user, password \
+                        FROM users \
+                        WHERE address = '%u' \
+                          AND allow_imap = 1
+user_query          = SELECT 999, 999, home, maildir AS mail \
+                        FROM users \
+                        WHERE address = '%u' \
+                          AND allow_imap = 1
+---------------------------------------------------------------------------
+
+
+/etc/postfix/main.cf:
+---------------------------------------------------------------------------
+...
+query                       = sqlite:\$config_directory/sql
+transport_maps              = \$query/transport.query
+
+virtual_mailbox_base        = /srv/mail
+virtual_minimum_uid         = 100
+virtual_uid_maps            = static:999
+virtual_gid_maps            = static:999
+virtual_mailbox_domains     = \$transport_maps
+virtual_mailbox_maps        = \$query/vmailbox.query
+virtual_alias_maps          = \$query/valiases.query
+
+smtpd_sasl_auth_enable      = yes
+smtpd_sasl_security_options = noanonymous
+...
+---------------------------------------------------------------------------
+
+
+/etc/postfix/sql/transport.query
+---------------------------------------------------------------------------
+dbpath = $OPTIONS{database}
+query  = SELECT transport FROM transport WHERE domain = '%s'
+---------------------------------------------------------------------------
+
+
+/etc/postfix/sql/vmailbox.query
+---------------------------------------------------------------------------
+dbpath = $OPTIONS{database}
+query  = SELECT maildir FROM users WHERE address = '%s'
+---------------------------------------------------------------------------
+
+
+/etc/postfix/sql/valiases.query
+---------------------------------------------------------------------------
+dbpath = $OPTIONS{database}
+query  = SELECT alias FROM virtual WHERE address = '%s'
+---------------------------------------------------------------------------
+
+
+EOF
+	exit 0;
+}
+
+sub op
+{
+	$_ = shift || "";
+	if (/^(list|ls)$/)           { return "ls";     }
+	if (/^(new|add)$/)           { return "add";    }
+	if (/^(del|rm)$/)            { return "rm";     }
+	if (/^(help|\?|)$/)          { return "help";   }
+	if (/^(passw(or)?d|reset)$/) { return "passwd"; }
+	if (/^(sub|subscribe)$/)     { return "sub";    }
+	if (/^un(sub|subscribe)$/)   { return "unsub";  }
+	return $_;
+}
+
+sub type
+{
+	$_ = shift || "";
+	if (/^(transports?|domains?)$/)   { return "domain"; }
+	if (/^(alias(es)?)$/)             { return "alias";  }
+	if (/^(m(ail)?box(es)?|users?)$/) { return "mbox";   }
+	if (/^((m(ail(ing)?)?)?lists?)$/) { return "list";   }
+	if (/^(sub(s(cribers?)?)?)$/)     { return "subs";   }
+	return $_;
+}
+
+sub schema
+{
+	print <<'EOF';
+CREATE TABLE accounts (
+	username character varying(127) NOT NULL,
+	domain character varying(128) NOT NULL,
+	name character varying(255) NOT NULL,
+	password character varying(128) NOT NULL,
+	PRIMARY KEY (username, domain)
+);
+
+CREATE TABLE aliases (
+	alias character varying(255) NOT NULL,
+	address character varying(255) NOT NULL,
+	PRIMARY KEY (alias)
+);
+
+CREATE TABLE transport (
+	domain character varying(128) NOT NULL,
+	transport character varying(50),
+	PRIMARY KEY (domain)
+);
+
+CREATE TABLE lists (
+	address character varying(255) NOT NULL,
+	name character varying(255) NOT NULL,
+	owner character varying(255) NOT NULL,
+	alias character varying(255) NOT NULL,
+	PRIMARY KEY (address)
+);
+
+CREATE VIEW users AS SELECT
+	accounts.username || '@' || accounts.domain AS address,
+	accounts.domain,
+	accounts.password,
+	accounts.name,
+	        '/srv/mail/' || accounts.domain || '/' || accounts.username AS home,
+	'maildir:/srv/mail/' || accounts.domain || '/' || accounts.username AS maildir,
+	                        accounts.domain || '/' || accounts.username || '/' as postfix,
+	1 AS allow_imap
+FROM accounts;
+EOF
+	exit 0;
+}
+
+sub netstr
+{
+	return length($_[0]).":$_[0],";
+}
+
+sub bail
+{
+	my ($error, @rest) = @_;
+	syslog(LOG_ERR, $error, @rest);
+
+	# don't accidentally leak internal information to network clients.
+	die "internal mail processing error\n";
+}
+
+sub ml_file
+{
+	my ($list, $relpath) = @_;
+	$relpath = "/$relpath" unless substr($relpath, 0, 1) eq "/";
+	"$OPTIONS{dataroot}/lists/$list$relpath";
+}
+
+sub ml_lock
+{
+	my ($list) = @_;
+	open my $fh, ">", ml_file($list, "/.lock")
+		or bail("unable to acquire lock for <$list>: $!");
+	flock($fh, LOCK_EX)
+		or bail("unable to acquire lock for <$list>: $!");
+	return $fh;
+}
+
+sub ml_unlock
+{
+	my ($fh) = @_;
+	flock($fh, LOCK_UN);
+	close($fh);
+}
+
+sub ml_hash
+{
+	my ($address) = @_;
+
+	my $h = 5381; # Perl-y djb hash...
+	$h = ($h + ($h << 5)) ^ (ord($_) & 0xffffffff) for split //, $address;
+	chr(65 + ($h % 27));
+}
+
+sub ml_hashes
+{
+	return split //, '@ABCDEFGHIJKLMNOPQRSTUVWXYZ';
+}
+
+sub ml_request
+{
+	my ($list, $name, %vars) = @_;
+	my $file = ml_file($list, "/requests/$name");
+	open my $fh, "<", $file
+		or bail("unable to open $file for reading: $!");
+	my $body = do { local $/; <$fh> };
+	close $fh;
+
+	for my $k (keys %vars) {
+		$body =~ s/\Q{{$k}}\E/$vars{$k}/g;
+	}
+	return $body;
+}
+
+sub ml_subscribed
+{
+	my ($list, $address) = @_;
+
+	my $h = ml_hash($address);
+	$address = netstr($address);
+
+	my $lock = ml_lock($list);
+	my $file = ml_file($list, "/subscribers/$h");
+	open my $fh, "<", $file or return undef;
+	while (<$fh>) {
+		chomp;
+		if ($address eq $_) {
+			close $fh;
+			return 1;
+		}
+	}
+	close $fh;
+	return undef;
+}
+
+sub ml_subscribe
+{
+	my ($list, $address) = @_;
+	return if ml_subscribed($list, $address);
+
+	my $h = ml_hash($address);
+	$address = netstr($address);
+
+	my $lock = ml_lock($list);
+	my $file = ml_file($list, "/subscribers/$h");
+	open my $fh, ">>", $file
+		or bail("unable to open $file for appending: $!");
+	printf $fh "$address\n";
+	close $fh;
+	ml_unlock($lock);
+}
+
+sub ml_unsubscribe
+{
+	my ($list, $address) = @_;
+	return unless ml_subscribed($list, $address);
+
+	my $h = ml_hash($address);
+	$address = netstr($address)."\n";
+
+	my $lock = ml_lock($list);
+	my $from = ml_file($list, "/subscribers/$h");
+	my $to   = ml_file($list, "/subscribers/.$h");
+	open my $out, ">", $to
+		or bail("unable to open $to for writing: $!");
+	open my $in, "<", $from
+		or bail("unable to open $from for reading: $!");
+	while (<$in>) {
+		print $out $_ unless $_ eq $address;
+	}
+	close $in;
+	close $out;
+	rename $to, $from
+		or bail("unable to rename $to -> $from: $!");
+	ml_unlock($lock);
+}
+
+sub ml_headermap
+{
+	my ($list) = @_;
+	my (%add, @add, %strip, %wrap);
+
+	my $lock = ml_lock($list);
+	my $file = ml_file($list, "/headers");
+	open my $fh, "<", $file
+		or bail("unable to open $file for reading: $!\n");
+	while (<$fh>) {
+		chomp; s/^\s+//; s/\s+$//;
+		next if m/^#/;
+		next if m/^$/;
+
+		if (m/^\+([^:]+):\s+(.*)$/) {
+			$add{lc($1)} = "$1: $2";
+			push @add, lc($1);
+			next;
+		}
+
+		if (m/^-([^:]+)\s*$/) {
+			$strip{lc($1)} = 1;
+			next;
+		}
+
+		if (m/^=([^:]+):\s*([^:]+)\s*$/) {
+			$wrap{lc($1)} = $2;
+			next;
+		}
+
+		bail("unrecognized $file line '$_'\n");
+	}
+	close $fh;
+	ml_unlock($lock);
+
+	return {
+		add   => \%add,
+		new   => \@add,
+		wrap  => \%wrap,
+		strip => \%strip,
+	};
+}
+
+sub listserv
+{
+	my ($sender, $list) = @_;
+	openlog('listserv', "pid", LOG_MAIL);
+	syslog(LOG_DEBUG, "vmail listserv starting up");
+
+	if (!$sender || !$list) {
+		bail("invalid usage (should be `$0 <sender> <list>`)");
+	}
+	syslog(LOG_INFO, "processing sender <%s> -> <%s>", $sender, $list);
+
+	# is "list" dest a variable envelope return-path?
+	# (i.e. <list-subscriber=other.doma.in@lists.doma.in>
+	if ($list =~ m/^([^-]+)-([^=]+)=([^@]+)@(.+)$/) {
+		my ($list, $sub) = ("$1\@$4", "$2\@$3");
+		syslog(LOG_INFO, "looks like a bounce from %s (on %s)", $sub, $list);
+		exit 0;
+	}
+
+	# how to handle input headers
+	my (%strip, %add, @add, %wrap);
+	my ($list_user, $list_domain) = split /@/, $list;
+	my $can_post = 1;
+	if ($list_user =~ s/-requests$//) {
+		$can_post = undef;
+		$list = "$list_user\@$list_domain";
+	} else {
+		$can_post = ml_subscribed($list, $sender);
+	}
+	my $listid = $list; $listid =~ s/@/./;
+
+	# read header translations
+	my $hmap = ml_headermap($list);
+
+	my ($headers, %headers);
+	my $skip = 0;
+	while (<STDIN>) {
+		last if /^$/;     # RFC822
+		next unless /\S/; # skip leading blank lines
+
+		if (m/^\s/) {
+			next if $skip;
+			$headers .= $_; next;
+		}
+		$skip = 0;
+
+		if (m/^([^:]+):\s+(.*)$/) {
+			my ($header, $key, $value) = ($1, lc($1), $2);
+
+			if ($key =~ m/^(to|message-id|subject|from)$/) {
+				$headers{$key} = $value;
+			}
+
+			if ($hmap->{strip}{$key}) {
+				$skip = 1; next;
+			}
+
+			if ($hmap->{wrap}{$key}) {
+				s/^[^:]+:/$hmap->{wrap}{$key}:/;
+				if ($hmap->{add}{$key}) {
+					$headers .= "$hmap->{add}{$key}\n";
+					delete $hmap->{add}{$key};
+					$skip = 1;
+				}
+				$headers .= $_; next;
+			}
+
+			if ($hmap->{add}{$key}) {
+				$headers .= "$hmap->{add}{$key}\n";
+				delete $hmap->{add}{$key};
+				$skip = 1; next;
+			}
+
+			$headers .= $_; next;
+		}
+	}
+
+	for (grep { $hmap->{add}{$_} } @{$hmap->{new}}) {
+		$headers .= "$hmap->{add}{$_}\n";
+	}
+	$headers .= "\n";
+	my $body = do { local $/; <STDIN>; } || '';
+
+	if ($headers{from} =~ m/mailer-daemon@/i) {
+		syslog(LOG_INFO, "bounce detected for <$headers{to}>");
+		exit 0;
+	}
+
+	my ($fh, $replyto);
+	my %vars = (
+		to      => $headers{to},
+		subject => $headers{subject},
+		msgid   => $headers{'mesage-id'},
+		domain  => $list_domain,
+		mailbox => $list_user,
+		list    => $list,
+		listid  => $listid,
+	);
+
+	# COMMAND: unsubscribe {{{
+	if ($body =~ m/^unsubscribe/s || $headers{subject} =~ m/\bunsubscribe\b/i) {
+		if (!ml_subscribed($list, $sender)) {
+			# sender not subscribed; ignore this spurious message
+			exit 0;
+		}
+		$replyto = $sender;
+
+		my $token;
+		if ($body             =~ m/confirm ([A-Za-z0-9]{17,})/) { $token = $1; }
+		if ($headers{subject} =~ m/confirm ([A-Za-z0-9]{17,})/) { $token = $1; }
+
+		if ($token) {
+			my $email = '';
+			open $fh, "<", ml_file($list, "/outstanding/unsub.$token") and do {
+				chomp($email = <$fh>);
+				close $fh;
+			};
+			syslog(LOG_INFO, "checking token [%s] sender <%s> against envelope-sender <%s>", $token, $email, $sender);
+			if ($email ne $sender) {
+				$headers = '';
+				$body = ml_request($list, 'unsubfail', %vars, token => $token);
+
+			} else {
+				ml_unsubscribe($list, $sender);
+				$headers = '';
+				$body = ml_request($list, 'unsubok', %vars, token => $token);
+			}
+		} else {
+			$token = vmail::randstr(23);
+			open $fh, ">", ml_file($list, "/outstanding/unsub.$token") and do {
+				print $fh "$sender\n";
+				print $fh time()."\n";
+				print $fh "-------------------------------------------\n";
+				print $fh "$headers\n\n$body\n";
+				close $fh;
+			};
+
+			$headers = '';
+			$body = ml_request($list, 'unsub', %vars, token => $token);
+		}
+	# }}}
+	# COMMAND: subscribe {{{
+	} elsif ($body =~ m/^subscribe/s || $headers{subject} =~ m/\bsubscribe\b/i) {
+		if (ml_subscribed($list, $sender)) {
+			# sender already subscribed; ignore this spurious message
+			exit 0;
+		}
+		$replyto = $sender;
+
+		my $token;
+		if ($body             =~ m/confirm ([A-Za-z0-9]{17,})/) { $token = $1; }
+		if ($headers{subject} =~ m/confirm ([A-Za-z0-9]{17,})/) { $token = $1; }
+
+		if ($token) {
+			syslog(LOG_INFO, "checking sub file %s for %s", ml_file($list, "/outstanding/sub.$token"), $list);
+			my $email = '';
+			open $fh, "<", ml_file($list, "/outstanding/sub.$token") and do {
+				chomp($email = <$fh>);
+				close $fh;
+			};
+			syslog(LOG_INFO, "checking token [%s] sender <%s> against envelope-sender <%s>", $token, $email, $sender);
+			if ($email ne $sender) {
+				$headers = '';
+				$body = ml_request($list, 'subfail', %vars, token => $token);
+
+			} else {
+				ml_subscribe($list, $sender);
+				$headers = '';
+				$body = ml_request($list, 'subok', %vars, token => $token);
+			}
+		} else {
+			$token = vmail::randstr(23);
+			open $fh, ">", ml_file($list, "/outstanding/sub.$token") and do {
+				print $fh "$sender\n";
+				print $fh time()."\n";
+				print $fh "-------------------------------------------\n";
+				print $fh "$headers\n\n$body\n";
+				close $fh;
+			};
+
+			$headers = '';
+			$body = ml_request($list, 'sub', %vars, token => $token);
+		}
+	# }}}
+	# COMMAND: ??? {{{
+	} elsif (!$can_post) {
+		$replyto = $sender;
+		$headers = '';
+		$body = ml_request($list, 'invalid', %vars);
+
+	# }}}
+	# valid list-bound message {{{
+	} else { # we can archive it....
+		# archive this message if we haven't seen it already
+		my $msgid = $headers{'message-id'}; $msgid =~ s/[^A-Za-z0-9.@-]//g;
+		my $file = ml_file($list, "/archives/$msgid.msg");
+		if (! -f $file) {
+			syslog(LOG_INFO, "archving %s to %s", $headers{'message-id'}, $file);
+			open $fh, ">", $file;
+			if (!$fh) {
+				syslog(LOG_WARNING, "unable to archive %s to %s: %s", $headers{'message-id'}, $file, $!);
+			} else {
+				print $fh "$headers$body";
+				close $fh;
+			};
+		} else {
+			syslog(LOG_INFO, "message %s ought not be archived; skipping", $headers{'message-id'});
+		}
+	}
+	# }}}
+
+	syslog(LOG_INFO, "connecting to qmqp server at localhost:628 for message submission");
+	my $sock = IO::Socket::INET->new(
+		PeerAddr => 'localhost',
+		PeerPort => 628,
+		Proto    => 'tcp',
+		Timeout  => 120,
+	) or bail("failed to send to qmqp://localhost:628 $!\n");
+
+	my $raw  = netstr($headers.$body);
+	   $raw .= netstr("$list_user-\@$list_domain-\@[]"); # Postfix verp
+
+	my $n = 0;
+	if ($replyto) {
+		$raw .= netstr($replyto);
+		$n++;
+
+	} else {
+		my $lock = ml_lock($list);
+		for my $h (ml_hashes()) {
+			my $file = ml_file($list, "/subscribers/$h");
+			open $fh, "<", $file or next;
+			while (<$fh>) {
+				chomp;
+				$raw .= $_;
+				$n++;
+			}
+			close $fh;
+		}
+		ml_unlock($lock);
+	}
+	if ($n == 0) {
+		syslog(LOG_ERR, "no <%s> list subscribers found; highly suspicious...", $list);
+		exit 0;
+	}
+
+	print STDERR $raw."\n";
+	print $sock netstr($raw);
+	my $res = do { local $/; <$sock> };
+	close $sock;
+
+	syslog(LOG_DEBUG, "response from qmqp daemon was [%s]", $res);
+	(undef, $res) = split /:/, $res; $res =~ s/,$//;
+	my $c = substr($res, 0, 1); $res = substr($res, 1);
+	if ($c eq 'K') {
+		syslog(LOG_INFO, "message delivery via qmqp succeeded: %s", $res);
+		exit 0;
+	}
+	if ($c eq 'D') {
+		bail("message delivery via qmqp failed permanently: (D) %s", $res);
+	}
+	if ($c eq 'Z') {
+		bail("message delivery via qmqp failed temporarily: (Z) %s", $res);
+	}
+	bail("unrecognized qmqp status code '%c' (%#02x)", $c, $c);
+}
+
+#########################################################################
+
+$OPTIONS{dataroot} = $ENV{VMAILROOT} || '/var/lib/vmail';
+$OPTIONS{database} = $ENV{VMAILDB}   || $OPTIONS{dataroot}.'/vmail.sqlite';
+die "Unable to determine vmail root or vmail database"
+	unless $OPTIONS{dataroot} && $OPTIONS{database};
+
+GetOptions(\%OPTIONS, qw/
+	help|h|?
+	database|d=s
+	dataroot|root|r=s
+	quiet|q
+	verbose|v+
+
+	owner|o=s
+	name|n=s
+	archives|a=s
+	restricted
+/) or help;
+help if $OPTIONS{help};
+
+eval { $V = vmail->new("dbi:SQLite:dbname=$OPTIONS{database}", $OPTIONS{verbose}) }
+	or die "Failed to connect ($OPTIONS{database}): ".DBI->errstr."\n";
+
+
+my $op = op(shift @ARGV);
+if ($op !~ m/^(passwd|help|guide|schema|listserv)$/) {
+	$op = "$op-" . type(shift @ARGV);
+}
+
+     if ($op eq  "ls-domain") {  list_domains;
+} elsif ($op eq "add-domain") {  new_domains @ARGV;
+} elsif ($op eq  "rm-domain") {  rm_domains  @ARGV;
+
+} elsif ($op eq   "ls-list")  {  list_lists;
+} elsif ($op eq  "add-list")  {  new_list @ARGV;
+} elsif ($op eq   "rm-list")  {  rm_lists @ARGV;
+
+} elsif ($op eq   "ls-subs")  {  list_subscribers;
+} elsif ($op eq       "sub")  {  subscribe   @ARGV;
+} elsif ($op eq     "unsub")  {  unsubscribe @ARGV;
+} elsif ($op eq     "block")  {  block       @ARGV;
+} elsif ($op eq   "unblock")  {  unblock     @ARGV;
+
+} elsif ($op eq  "ls-alias")  {  list_aliases @ARGV;
+} elsif ($op eq "add-alias")  {  new_alias    @ARGV;
+} elsif ($op eq  "rm-alias")  {  rm_aliases   @ARGV;
+
+} elsif ($op eq  "ls-mbox")   {  list_mailboxes @ARGV;
+} elsif ($op eq "add-mbox")   {  new_mailbox    @ARGV;
+} elsif ($op eq  "rm-mbox")   {  rm_mailbox     @ARGV;
+
+} elsif ($op eq     "help")   {  help;
+} elsif ($op eq   "passwd")   {  passwd @ARGV;
+} elsif ($op eq    "guide")   {  guide;
+} elsif ($op eq   "schema")   {  schema;
+} elsif ($op eq "listserv")   {  listserv @ARGV;
+} else {
+	$op =~ s/-/ /;
+	print STDERR "Unknown command: $op\nTry $0 help\n";
+	exit 1;
+}
+
+__DATA__
+--- invalid ---------------------------
+From: {{mailbox}}-requests@{{domain}}
+To: {{to}}
+In-Reply-To: {{msgid}}
+Subject: Re: {{subject}}
+Precedence: bulk
+List-Id: <{{listid}}>
+List-Owner: <mailto:{{mailbox}}-owner@{{domain}}>
+
+Hi,
+
+This is the list management service at {{domain}}.
+Unfortunately, I was unable to understand your request,
+bound for the <{{list}}> list.
+
+To subscribe to the list, send an empty email with the subject
+'subscribe' to <{{mailbox}}-requests@{{domain}}>.
+
+Thanks!
+Mailing List Service
+{{list}}
+
+--- sub ---------------------------
+From: {{mailbox}}-requests@{{domain}}
+To: {{to}}
+In-Reply-To: {{msgid}}
+Subject: Re: {{subject}} [confirm {{token}}]
+Precedence: bulk
+List-Id: <{{listid}}>
+List-Owner: <mailto:{{mailbox}}-owner@{{domain}}>
+
+Hi,
+
+This is the list management service at {{domain}}.
+I recently received a request to subscribe this email address
+to the <{{list}}> mailing list.
+
+Before I do so, I need to make sure that you originated this
+request, and do in fact want to receive messages from the
+<{{list}}> mailing list.
+
+To confirm your subscription, all you need to do is reply to
+this message; I will finish processing your subscription
+request upon receipt of said reply.
+
+If you did not request subscription, feel free to ignore this
+message; I just won't subscribe you to <{{list}}>.
+
+Thanks!
+Mailing List Service
+{{list}}
+confirm {{token}}
+
+--- subfail ---------------------------
+From: {{mailbox}}-requests@{{domain}}
+To: {{to}}
+In-Reply-To: {{msgid}}
+Subject: Re: {{subject}}
+Precedence: bulk
+List-Id: <{{listid}}>
+List-Owner: <mailto:{{mailbox}}-owner@{{domain}}>
+
+Hi,
+
+This is the list management service at {{domain}}.
+
+Unfortunately, I was unable to process your subscription request,
+because the confirmation token I received has either expired, was
+garbled in-transit, or never existed.
+
+To sign up to receive messages from this list, just send an email
+containing the subject 'subscribe', or the word 'subscribe' in the
+body of the email (and not much else) to this address,
+<{{mailbox}}-requests@{{domain}}>.
+
+Thanks!
+Mailing List Service
+{{list}}
+token {{token}}
+
+--- subok ---------------------------
+From: {{mailbox}}-requests@{{domain}}
+To: {{to}}
+In-Reply-To: {{msgid}}
+Subject: Re: {{subject}}
+Precedence: bulk
+List-Id: <{{listid}}>
+List-Owner: <mailto:{{mailbox}}-owner@{{domain}}>
+
+Hi,
+
+This is the list management service at {{domain}}.
+
+You have been subscribed to <{{list}}>.
+
+You should begin to receive new messages from the list immediately.
+To unsubscribe from this list, just send an email with the subject
+'unsubscribe', or the word 'unsubscribe' in the body of the message
+(and not much else) to this address,
+<{{mailbox}}-requests@{{domain}}>.
+
+Thanks!
+Mailing List Service
+{{list}}
+
+--- unsub ---------------------------
+Hi,
+
+This is the list management service at {{domain}}.
+I recently received a request to unsubscribe this email address
+from the <{{list}}> mailing list.
+
+Before I do so, I need to make sure that you originated this
+request, and do in fact want to stop receiving messages from
+the <{{list}}> mailing list.
+
+To confirm your removal, all you need to do is reply to this
+message; I will finish processing your removal request upon
+receipt of said reply.
+
+If you want to continue receiving messages from the list, feel
+free to ignore this message; I just won't unsubscribe you from
+<{{list}}>.
+
+Thanks!
+Mailing List Service
+{{list}}
+confirm {{token}}
+
+--- unsubfail ---------------------------
+From: {{mailbox}}-requests@{{domain}}
+To: {{to}}
+In-Reply-To: {{msgid}}
+Subject: Re: {{subject}}
+Precedence: bulk
+List-Id: <{{listid}}>
+List-Owner: <mailto:{{mailbox}}-owner@{{domain}}>
+
+Hi,
+
+This is the list management service at {{domain}}.
+
+Unfortunately, I was unable to process your (un)subscription request,
+because the confirmation token I received has either expired, was
+garbled in-transit, or never existed.
+
+To stop receiving messages from this list, just send an email with
+the subject 'unsubscribe', or the word 'unsubscribe' in the body of
+the message (and not much else) to this address,
+<{{mailbox}}-requests@{{domain}}>.
+
+Thanks!
+Mailing List Service
+{{list}}
+token {{token}}
+
+--- unsubok ---------------------------
+From: {{mailbox}}-requests@{{domain}}
+To: {{to}}
+In-Reply-To: {{msgid}}
+Subject: Re: {{subject}}
+Precedence: bulk
+List-Id: <{{listid}}>
+List-Owner: <mailto:{{mailbox}}-owner@{{domain}}>
+
+Hi,
+
+This is the list management service at {{domain}}.
+
+You have been unsubscribed from <{{list}}>.
+
+You should no longer receive messages from the list.
+
+To (re)subscribe to this list, just send an email with the subject
+'subscribe', or the word 'subscribe' in the body of the message
+(and not much else) to this address,
+<{{mailbox}}-requests@{{domain}}>.
+
+Thanks!
+Mailing List Service
+{{list}}
